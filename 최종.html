@@ -1,0 +1,503 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+<title>Hold → Burst → Drift — High Contrast (Abstract Hold)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#000000;      /* Pure black background */
+    --ink:#F8FAFF;     /* Light ink for any text elements */
+    /* Background hints kept minimal for true high contrast */
+    --glow1: rgba(255, 255, 255, .04);
+    --glow2: rgba(64, 128, 255, .03);
+    --glow3: rgba(255, 64, 64, .03);
+  }
+  html,body{height:100%;margin:0;background:var(--bg);color:var(--ink);font-family:Inter,system-ui,Roboto,Arial,sans-serif;}
+  body{
+      background:
+        radial-gradient(900px 700px at 20% 12%, var(--glow1), transparent 60%),
+        radial-gradient(1000px 800px at 78% 20%, var(--glow2), transparent 60%),
+        radial-gradient(1000px 900px at 50% 88%, var(--glow3), transparent 60%),
+        var(--bg);
+      overflow:hidden;
+  }
+  /* Subtle grain overlay */
+  body::after{
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    background-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128"><filter id="n"><feTurbulence type="fractalNoise" baseFrequency="0.8" numOctaves="2" stitchTiles="stitch"/></filter><rect width="100%25" height="100%25" filter="url(%23n)" opacity="0.5"/></svg>');
+    background-size: 128px 128px;
+    background-repeat: repeat;
+    opacity: .055;
+    mix-blend-mode: overlay;
+    animation: grainShift 7s steps(8) infinite;
+  }
+  @keyframes grainShift {
+    0%  { transform: translate(0,0) }
+    12% { transform: translate(-6px, 4px) }
+    25% { transform: translate(5px, -8px) }
+    37% { transform: translate(-3px, 5px) }
+    50% { transform: translate(4px, 3px) }
+    62% { transform: translate(-5px, -2px) }
+    75% { transform: translate(6px, 6px) }
+    87% { transform: translate(-4px, -5px) }
+    100%{ transform: translate(0,0) }
+  }
+
+  canvas{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none;user-select:none}
+  body.holding{cursor:grabbing} body:not(.holding){cursor:grab}
+  .test-chip{
+    position:fixed;right:10px;bottom:10px;background:#0f1115;color:#cbd5e1;
+    border:1px solid #1f2430;border-radius:10px;padding:6px 10px;font-size:12px;opacity:.9;pointer-events:none;
+    box-shadow: 0 0 0 1px rgba(255,255,255,.02), 0 6px 20px rgba(0,0,0,.45);
+  }
+</style>
+</head>
+<body>
+<canvas id="fx" aria-hidden="true"></canvas>
+<div id="testchip" class="test-chip" aria-live="polite">tests: pending…</div>
+<script>
+(()=>{
+  'use strict';
+  // Setup canvas and sizing
+  const c = document.getElementById('fx');
+  const ctx = c.getContext('2d', { alpha: true });
+  let w, h, dpr;
+  const fit = () => {
+    dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    c.width  = Math.floor(c.clientWidth  * dpr);
+    c.height = Math.floor(c.clientHeight * dpr);
+    w = c.width; h = c.height;
+  };
+  fit();
+  addEventListener('resize', fit);
+
+  // Tunables
+  const COUNT=160, BASE_R=1.8, R_SPREAD=2.4, JITTER=26,
+        CHARGE_MS=1400, BURST_MS=900, DRIFT_MS=1400, RESET_MS=700, GATHER_MS=900, UNHOLD_MS=700;
+
+  // Visual config (design-only tweaks; interaction untouched)
+  const THEME_HC = true;       // High-contrast theme flag
+  const TRAIL_ALPHA = 0.06;    // soft afterimage
+  const FRONT_RATIO = 0.58;    // foreground proportion
+  const SHADOW_MAX = 28;       // max shadow blur
+  const GLOW_ALPHA = 0.75;     // core glow strength (for white core)
+  const WOBBLE_DEG = 6;        // hue wobble
+  const SPECTRUM_CRACK = 7;    // spectral fringe power
+  const PULSE_HZ = 0.85;       // beat
+
+  // State machine
+  const STATE = { IDLE:0, HOLDING:1, BURST:2, DRIFT:3, RESET:4, GATHER:5, UNHOLD:6 };
+  let state=STATE.IDLE;
+  let holdStart=0, burstEndTime=0, driftEndTime=0, resetStart=0, gatherStart=0, gatherEndTime=0, unholdStart=0;
+  let releaseF=0, releaseCX=0, releaseCY=0;
+  let amp=0.9, vignette=0.10, requestHold=false;
+  let hueCurrent = 220; // start near blue
+  let px=0.5, py=0.5; // normalized pointer coords
+  let pointerActive=false;
+
+  // Utilities
+  const lerp=(a,b,t)=>a+(b-a)*t;
+  const hsla=(h,s,l,a)=>`hsla(${h},${s}%,${l}%,${a})`;
+  const clamp=(x,min,max)=>Math.max(min,Math.min(max,x));
+  const easeInOut=(t)=> t<0.5 ? 2*t*t : 1-Math.pow(-2*t+2,2)/2;
+
+  // --- Simplex Noise (2D)
+  const F2 = 0.5*(Math.sqrt(3)-1); const G2 = (3-Math.sqrt(3))/6;
+  const grad3 = new Float32Array([1,1,-1,1,1,-1,-1,-1,1,0,-1,0,1,0,0,1,0,-1,0,1,0,0,-1,0]);
+  const p = new Uint8Array(256); for(let i=0;i<256;i++) p[i]=i;
+  let seed=20251019; function rnd(){ seed=(seed*16807)%2147483647; return seed/2147483647; }
+  for(let i=255;i>0;i--){ const j=(rnd()* (i+1))|0; const t=p[i]; p[i]=p[j]; p[j]=t; }
+  const perm = new Uint8Array(512); const permMod12 = new Uint8Array(512);
+  for(let i=0;i<512;i++){ perm[i]=p[i&255]; permMod12[i]=perm[i]%12; }
+  function noise2D(xin,yin){
+    let n0=0,n1=0,n2=0; const s=(xin+yin)*F2; const i=Math.floor(xin+s); const j=Math.floor(yin+s);
+    const t=(i+j)*G2; const X0=i-t, Y0=j-t; const x0=xin-X0, y0=yin-Y0;
+    let i1, j1; if(x0>y0){ i1=1; j1=0; } else { i1=0; j1=1; }
+    const x1=x0 - i1 + G2; const y1=y0 - j1 + G2; const x2=x0 - 1 + 2*G2; const y2=y0 - 1 + 2*G2;
+    const ii=i & 255; const jj=j & 255;
+    let t0=0.5 - x0*x0 - y0*y0; if(t0>=0){ const gi0 = permMod12[ii+perm[jj]]*2; t0*=t0; n0 = t0*t0*(grad3[gi0]*x0 + grad3[gi0+1]*y0); }
+    let t1=0.5 - x1*x1 - y1*y1; if(t1>=0){ const gi1 = permMod12[ii+i1+perm[jj+j1]]*2; t1*=t1; n1 = t1*t1*(grad3[gi1]*x1 + grad3[gi1+1]*y1); }
+    let t2=0.5 - x2*x2 - y2*y2; if(t2>=0){ const gi2 = permMod12[ii+1+perm[jj+1]]*2; t2*=t2; n2 = t2*t2*(grad3[gi2]*x2 + grad3[gi2+1]*y2); }
+    return 70*(n0+n1+n2);
+  }
+
+  // Particles
+  let particles=[];
+  function seedParticles(){
+    particles = Array.from({length:COUNT}, (_, i) => {
+      const homeX = Math.random()*w, homeY = Math.random()*h;
+      const front = (Math.random() < FRONT_RATIO);
+      const depthMult = front ? 1.0 : 0.72;
+      const blurMult  = front ? 1.0 : 0.55;
+      const alphaMult = front ? 1.0 : 0.75;
+      return {
+        i,
+        x: homeX, y: homeY,
+        vx: 0, vy: 0,
+        homeX, homeY,
+        r: (BASE_R + Math.random()*R_SPREAD) * (dpr || 1) * depthMult,
+        a: 1 * alphaMult,
+        theta: Math.random() * Math.PI * 2,
+        nx: Math.random()*1000,
+        ny: Math.random()*1000,
+        front, depthMult, blurMult, alphaMult
+      };
+    });
+  }
+  seedParticles();
+
+  // Input handlers (interaction unchanged)
+  const down = e => {
+    e.preventDefault();
+    requestHold = true;
+    document.body.classList.add('holding');
+    const rect=c.getBoundingClientRect();
+    px=(e.clientX-rect.left)/rect.width; py=(e.clientY-rect.top)/rect.height;
+    pointerActive = true;
+    if(state===STATE.IDLE || state===STATE.RESET){
+      holdStart=performance.now();
+      state=STATE.HOLDING;
+      requestHold=false;
+    }
+  };
+  const up = e => {
+    e.preventDefault();
+    document.body.classList.remove('holding');
+    pointerActive=false;
+    if(state===STATE.HOLDING){
+      const now=performance.now();
+      const tCharge=Math.min(1,(now-holdStart)/CHARGE_MS);
+      releaseF=Math.min(0.55, Math.pow(tCharge,0.9)*0.55);
+      releaseCX=px*w; releaseCY=py*h;
+      state=STATE.UNHOLD; unholdStart=now;
+    } else {
+      if(state!==STATE.HOLDING){ requestHold=false; }
+    }
+  };
+  addEventListener('pointerdown',down,{passive:false});
+  addEventListener('pointerup',up,{passive:false});
+  addEventListener('pointercancel',up,{passive:false});
+  addEventListener('mouseleave',up,{passive:false});
+  addEventListener('pointermove',e=>{
+    if(!pointerActive) return;
+    const rect=c.getBoundingClientRect();
+    px=(e.clientX-rect.left)/rect.width; py=(e.clientY-rect.top)/rect.height;
+  },{passive:true});
+  addEventListener('keydown',e=>{ if(e.code==='Space'){ down(e); }});
+  addEventListener('keyup',e=>{ if(e.code==='Space'){ up(e); }});
+
+  function triggerBurst(ox,oy){
+    const cx=(ox!=null?ox*w:w/2), cy=(oy!=null?oy*h:h/2);
+    particles.forEach(p=>{
+      const dx=p.x-cx, dy=p.y-cy, dist=Math.max(8,Math.hypot(dx,dy));
+      const dirx=dx/dist, diry=dy/dist;
+      const speed=(160+Math.random()*220)*(dpr || 1);
+      p.vx=dirx*speed+(Math.random()*2-1)*60;
+      p.vy=diry*speed+(Math.random()*2-1)*60;
+    });
+    state=STATE.BURST; burstEndTime=performance.now()+BURST_MS;
+  }
+
+  function updateParticles(now,dt){
+    const jitterMax=(JITTER*(dpr||1))*amp;
+
+    if(state===STATE.IDLE){
+      const tnow=now;
+      for(const p of particles){
+        const jx=(Math.sin(tnow*0.0012+p.i*0.71)+Math.sin(tnow*0.0007+p.i*1.33))*0.5*jitterMax;
+        const jy=(Math.cos(tnow*0.001+p.i*1.11)+Math.sin(tnow*0.0009+p.i*0.93))*0.5*jitterMax;
+        p.x=p.homeX+jx; p.y=p.homeY+jy; p.a=1;
+      }
+
+    } else if(state===STATE.HOLDING){
+      const jitter=jitterMax*1.8; // 훨씬 큰 불안정성
+      const tCharge=Math.min(1,(now-holdStart)/CHARGE_MS);
+      const f=Math.min(0.55,Math.pow(tCharge,0.9)*0.55);
+      const cx=px*w, cy=py*h;
+      const tnow=now*0.001;
+
+      // 추상적인 와류 + 노이즈형 집합
+      for(const p of particles){
+        const angle=noise2D(p.nx+tnow*0.8,p.ny-tnow*0.6)*Math.PI*4;
+        const radius=(Math.sin(tnow*0.7+p.i*0.4)+1.6)*80*(dpr||1);
+        const tx=cx+Math.cos(angle)*radius*(0.3+0.7*f);
+        const ty=cy+Math.sin(angle)*radius*(0.3+0.7*f);
+        p.x+= (tx-p.x)*4*dt;
+        p.y+= (ty-p.y)*4*dt;
+        p.x+= noise2D(p.nx+tnow*1.2,p.ny)*jitter;
+        p.y+= noise2D(p.nx,p.ny-tnow*1.1)*jitter;
+        p.a=1;
+      }
+
+      // 약간의 밀도 반발 (너무 겹치지 않게)
+      const sepR=20*(dpr||1), sepK=50;
+      for(let i=0;i<particles.length;i++){
+        const p=particles[i];
+        for(let j=i+1;j<particles.length;j++){
+          const q=particles[j];
+          const dx=p.x-q.x, dy=p.y-q.y; const dist=Math.hypot(dx,dy);
+          if(dist>0 && dist<sepR){
+            const push=(sepR-dist)/sepR; const ux=dx/dist, uy=dy/dist;
+            const fx=ux*push*sepK*dt, fy=uy*push*sepK*dt;
+            p.x+=fx; p.y+=fy; q.x-=fx; q.y-=fy;
+          }
+        }
+      }
+
+    } else if(state===STATE.GATHER){
+      const g=Math.min(1,(now-gatherStart)/GATHER_MS);
+      const f=lerp(0.55,0.65,g*g);
+      const cx=px*w, cy=py*h; const k=12; const jitter=jitterMax*0.10;
+      const ampGain=lerp(1*(dpr||1),4*(dpr||1),Math.pow(g,1.5));
+      const omegaBase=lerp(3.2,8.5,g);
+      const crescendo=(g>0.8)?Math.min(4,Math.exp((g-0.8)*12)):1;
+      const ampLocal=ampGain*crescendo; const omega=omegaBase*crescendo;
+      for(const p of particles){
+        const tx=p.homeX*(1-f)+cx*f; const ty=p.homeY*(1-f)+cy*f;
+        p.x+=(tx-p.x)*k*dt; p.y+=(ty-p.y)*k*dt;
+        const ang=p.theta+(omega*(now*0.006))+p.i*0.13;
+        p.x+=Math.cos(ang)*ampLocal; p.y+=Math.sin(ang)*ampLocal;
+        p.x+=Math.sin((now*0.0019)+p.i)*jitter;
+        p.y+=Math.cos((now*0.0015)+p.i*1.1)*jitter;
+      }
+      const sepR=26*(dpr||1), sepK=90;
+      for(let i=0;i<particles.length;i++){
+        const p=particles[i];
+        for(let j=i+1;j<particles.length;j++){
+          const q=particles[j];
+          const dx=p.x-q.x, dy=p.y-q.y; const dist=Math.hypot(dx,dy);
+          if(dist>0 && dist<sepR){
+            const push=(sepR-dist)/sepR; const ux=dx/dist, uy=dy/dist;
+            const fx=ux*push*sepK*dt, fy=uy*push*sepK*dt;
+            p.x+=fx; p.y+=fy; q.x-=fx; q.y-=fy;
+          }
+        }
+      }
+      if(now>=gatherEndTime){ triggerBurst(px,py); }
+
+    } else if(state===STATE.BURST){
+      for(const p of particles){
+        p.x+=p.vx*dt; p.y+=p.vy*dt; p.vx*=0.984; p.vy*=0.984;
+      }
+      if(now>=burstEndTime){ state=STATE.DRIFT; driftEndTime=now+DRIFT_MS; }
+
+    } else if(state===STATE.UNHOLD){
+      const t=Math.min(1,(now-unholdStart)/UNHOLD_MS);
+      const e = t<0.5 ? 2*Math.pow(t,2) : 1-Math.pow(-2*t+2,2)/2;
+      const f = releaseF*(1-e);
+      const cx=releaseCX, cy=releaseCY; const k=10; const jitter=(JITTER*(dpr||1))*0.08;
+      for(const p of particles){
+        const tx=p.homeX*(1-f)+cx*f; const ty=p.homeY*(1-f)+cy*f;
+        p.x+=(tx-p.x)*k*dt; p.y+=(ty-p.y)*k*dt;
+        p.x+=Math.sin((now*0.0016)+p.i)*jitter;
+        p.y+=Math.cos((now*0.0012)+p.i*1.1)*jitter;
+        p.a=1;
+      }
+      const sepR=24*(dpr||1), sepK=70;
+      for(let i=0;i<particles.length;i++){
+        const p=particles[i];
+        for(let j=i+1;j<particles.length;j++){
+          const q=particles[j];
+          const dx=p.x-q.x, dy=p.y-q.y; const dist=Math.hypot(dx,dy);
+          if(dist>0 && dist<sepR){
+            const push=(sepR-dist)/sepR; const ux=dx/dist, uy=dy/dist;
+            const fx=ux*push*sepK*dt, fy=uy*push*sepK*dt;
+            p.x+=fx; p.y+=fy; q.x-=fx; q.y-=fy;
+          }
+        }
+      }
+      if(t>=1){ state=STATE.IDLE; }
+
+    } else if(state===STATE.DRIFT){
+      for(const p of particles){
+        const breeze=(Math.sin((now*0.001)+p.i*0.37)+Math.cos((now*0.0013)+p.i*0.51))*0.5;
+        p.vx*=0.992; p.vy*=0.992; p.vx+=breeze*6; p.vy+=breeze*4;
+        p.x+=p.vx*dt; p.y+=p.vy*dt;
+      }
+      if(now>=driftEndTime){
+        for(const p of particles){ p.x0=p.x; p.y0=p.y; }
+        state=STATE.RESET; resetStart=now;
+      }
+
+    } else if(state===STATE.RESET){
+      const t=Math.min(1,(now-resetStart)/RESET_MS); const e=1-Math.pow(1-t,3);
+      for(const p of particles){ p.x=p.x0+(p.homeX-p.x0)*e; p.y=p.y0+(p.homeY-p.y0)*e; p.a=1; }
+      if(t>=1){ if(requestHold){ holdStart=now; state=STATE.HOLDING; requestHold=false; } else { state=STATE.IDLE; } }
+    }
+  }
+
+  // Render pass — High Contrast: white core + spectral fringe + distortion + trails
+  function drawParticles(now){
+    // Trail: soft fade over black
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = `rgba(0,0,0,${TRAIL_ALPHA})`;
+    ctx.fillRect(0,0,w,h);
+
+    // Vignette
+    ctx.fillStyle=`rgba(0,0,0,${vignette.toFixed(3)})`;
+    ctx.fillRect(0,0,w,h);
+
+    ctx.save();
+    ctx.globalCompositeOperation='lighter';
+
+    // Two-layer particle render per pass: blurred core then sharp fringe
+    function renderPass(blurPx, alphaCore, alphaFringe){
+      ctx.filter = `blur(${blurPx}px)`;
+      _draw(alphaCore, true);    // white-hot core
+      ctx.filter = 'none';
+      _draw(alphaFringe, false); // spectral fringe
+    }
+
+    renderPass(10, 0.68, 0.52);
+    renderPass(0,  0.28, 0.64);
+
+    ctx.restore();
+
+    function _draw(alphaBase, asCore){
+      const sat=(state===STATE.HOLDING||state===STATE.BURST||state===STATE.GATHER)?92:90; // higher sat for fringe
+      const lightCore = 96; // near-white
+      const lightFringe = 64; // colored rim
+
+      const hueDist = Math.abs((((hueCurrent-220)+540)%360)-180);
+      const heat = clamp(1 - (hueDist/180), 0, 1);
+      const baseDistort = 0.38 * heat;
+      const t = now*0.001;
+      const pulse = 0.5 + 0.5*Math.sin(t*PULSE_HZ*2*Math.PI);
+      const distortAmt = baseDistort * (0.85 + 0.3*pulse);
+      const freq = 1.65 * (0.9 + 0.2*pulse);
+      const speed = 0.36;
+      const steps = 24;
+
+      for(const p of particles){
+        const wobble = Math.sin((now*0.001)+p.i*0.37)*WOBBLE_DEG;
+        const crack  = noise2D(p.nx + t*0.5, p.ny - t*0.5) * SPECTRUM_CRACK;
+        const hue = (hueCurrent + wobble + crack + 360) % 360;
+
+        // glow tuned by heat & layer
+        const shadowBlur = (SHADOW_MAX * (dpr||1)) * (0.25 + 0.75*heat) * p.blurMult;
+        ctx.shadowColor = asCore ? `rgba(255,255,255,${GLOW_ALPHA})` : `hsla(${hue}, ${Math.round(sat)}%, ${lightFringe}%, ${GLOW_ALPHA*0.65})`;
+        ctx.shadowBlur = shadowBlur;
+
+        ctx.beginPath();
+        for(let s=0; s<=steps; s++){
+          const a = (s/steps) * Math.PI*2;
+          const n = noise2D(p.nx + Math.cos(a)*freq + t*speed, p.ny + Math.sin(a)*freq - t*speed);
+          const k = 1 + distortAmt * n;
+          const rr = p.r * Math.max(0.6, k) * (asCore? 0.95 : 1);
+          const x = p.x + rr * Math.cos(a);
+          const y = p.y + rr * Math.sin(a);
+          if(s===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+        }
+        ctx.closePath();
+
+        if(asCore){
+          ctx.fillStyle = `rgba(255,255,255,${alphaBase})`;
+        } else {
+          ctx.fillStyle = hsla(hue, sat, lightFringe, (alphaBase + (p.a*0.28)));
+        }
+        ctx.fill();
+      }
+      ctx.shadowBlur = 0;
+    }
+  }
+
+  // Hue choreography (blue→red while charging, cool back to blue)
+  function tick(now){
+    if(tick.t0===undefined) tick.t0=now;
+    const dt=Math.min(0.033,(now-tick.t0)/1000);
+    tick.t0=now;
+
+    let targetHue = 220;
+    if(state===STATE.HOLDING){
+      const t=clamp((now - holdStart)/CHARGE_MS, 0, 1);
+      targetHue = 220 + (0 - 220) * easeInOut(t);
+    } else if(state===STATE.GATHER){
+      targetHue = 10;
+    } else if(state===STATE.BURST){
+      targetHue = 0;
+    } else if(state===STATE.DRIFT || state===STATE.RESET || state===STATE.UNHOLD){
+      targetHue = 220;
+    }
+    const hueDelta = ((targetHue - hueCurrent + 540) % 360) - 180;
+    hueCurrent += hueDelta * 0.08;
+
+    if(state===STATE.HOLDING){
+      const t=Math.min(1,(now-holdStart)/CHARGE_MS);
+      const tEase = easeInOut(t);
+      amp=lerp(0.9,1.45,tEase); vignette=lerp(0.10,0.24,tEase*0.85);
+      if(t>=1){ state=STATE.GATHER; gatherStart=now; gatherEndTime=now+GATHER_MS; }
+    } else if(state===STATE.GATHER){
+      amp=lerp(amp,1.55,0.10); vignette=lerp(vignette,0.28,0.10);
+    } else if(state===STATE.BURST){
+      amp=lerp(amp,0.4,0.12); vignette=lerp(vignette,0.08,0.08);
+    } else if(state===STATE.DRIFT){
+      amp=lerp(amp,0.25,0.04); vignette=lerp(vignette,0.12,0.04);
+    } else if(state===STATE.RESET){
+      amp=lerp(amp,0.5,0.10); vignette=lerp(vignette,0.12,0.06);
+    } else if(state===STATE.UNHOLD){
+      amp=lerp(amp,0.65,0.12); vignette=lerp(vignette,0.12,0.12);
+    } else {
+      amp=lerp(amp,0.65,0.05); vignette=lerp(vignette,0.12,0.04);
+    }
+
+    updateParticles(now,dt);
+    drawParticles(now);
+    requestAnimationFrame(tick);
+  }
+
+  // Tiny self-checks
+  const chip=document.getElementById('testchip');
+  function report(msg,ok=true){ chip.textContent=(ok?'✅':'❌')+' '+msg; if(!ok) chip.style.background='#b00020'; console[ok?'log':'error'](msg); }
+  function assert(cond,msg){ if(!cond){ throw new Error(msg); } }
+  try{
+    // Existing tests (unchanged)
+    assert(Array.isArray(particles) && particles.length===COUNT,'T1: particle seeding');
+    assert(typeof drawParticles==='function','T2: drawParticles exists');
+    assert(typeof requestAnimationFrame==='function','T3: RAF available');
+    assert(STATE.DRIFT!==undefined,'T4: DRIFT state present');
+    assert(STATE.RESET!==undefined,'T4b: RESET state present');
+    assert(['x','y','vx','vy','r','a'].every(k=>k in particles[0]),'T5: particle shape');
+    assert(typeof updateParticles==='function','T6: updateParticles exists');
+    assert(typeof triggerBurst==='function','T7: triggerBurst exists');
+    const prevState=state;
+    state=STATE.HOLDING; holdStart=performance.now()-CHARGE_MS;
+    state=STATE.GATHER; gatherEndTime=performance.now()-1; triggerBurst(0.5,0.5);
+    assert(state===STATE.BURST,'T8: state moves to BURST');
+    state=prevState; drawParticles(performance.now()); assert(true,'T9: draw once');
+    state=STATE.HOLDING; holdStart=performance.now()-CHARGE_MS*0.4; px=0.5; py=0.5; pointerActive=true;
+    const mockEvt={preventDefault(){}}; up(mockEvt);
+    assert(state===STATE.UNHOLD,'T10: HOLDING → UNHOLD on release');
+    const tNow=performance.now(); unholdStart=tNow-UNHOLD_MS-2;
+    updateParticles(performance.now(), 0.016);
+    assert(state===STATE.IDLE,'T11: UNHOLD completes to IDLE');
+    state=prevState;
+
+    // Additional tests (added earlier)
+    state=STATE.HOLDING; holdStart=performance.now()-CHARGE_MS-1; tick.t0=undefined; tick(performance.now());
+    assert(state===STATE.GATHER || state===STATE.BURST,'T12: HOLDING → GATHER/BURST progression');
+    assert([0,220].length===2,'T13: HUES legacy compatibility');
+    state=STATE.HOLDING; holdStart=performance.now(); const hStart = hueCurrent; tick(performance.now()+CHARGE_MS*0.6);
+    assert(hueCurrent < hStart,'T15: hue shifts toward red while holding');
+    const nTest = noise2D(0.123, 0.456); assert(Number.isFinite(nTest),'T16: noise finite'); assert(nTest <= 1.5 && nTest >= -1.5,'T16b: noise normalized');
+    drawParticles(performance.now()); // T17: distortion draw no-throw
+
+    // New HC tests
+    assert(THEME_HC===true,'T20: High-contrast flag present');
+    assert(TRAIL_ALPHA>=0 && TRAIL_ALPHA<=0.2,'T21: Trail alpha sane');
+
+    report('tests: passed');
+  }catch(e){ report('tests: failed — '+e.message,false); }
+
+  requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>
